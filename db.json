@@ -1,0 +1,106 @@
+{
+  "meta": {
+    "version": "v1",
+    "created_at": "2025-10-28T00:10:43.189Z"
+  },
+  "users": [
+    {
+      "id": 1,
+      "name": "User A",
+      "roi_convert_to_usd": true
+    },
+    {
+      "id": 2,
+      "name": "User B",
+      "roi_convert_to_usd": true
+    }
+  ],
+  "wallets": [
+    {
+      "userId": 1,
+      "asset": "USD",
+      "available": 232.1,
+      "frozen": 0
+    },
+    {
+      "userId": 1,
+      "asset": "USDT",
+      "available": 150,
+      "frozen": 0
+    },
+    {
+      "userId": 1,
+      "asset": "TRX",
+      "available": 1200,
+      "frozen": 0
+    },
+    {
+      "userId": 1,
+      "asset": "BTC",
+      "available": 0.01,
+      "frozen": 0
+    },
+    {
+      "userId": 2,
+      "asset": "USD",
+      "available": 1.18,
+      "frozen": 0
+    },
+    {
+      "userId": 2,
+      "asset": "USDT",
+      "available": 0,
+      "frozen": 0
+    },
+    {
+      "userId": 2,
+      "asset": "TRX",
+      "available": 0,
+      "frozen": 0
+    },
+    {
+      "userId": 2,
+      "asset": "BTC",
+      "available": 0,
+      "frozen": 0
+    }
+  ],
+  "payouts": [
+    {
+      "user_id": 1,
+      "plan_id": 101,
+      "original_currency": "TRX",
+      "original_amount": 45,
+      "fx_rate_to_usd": 0.0955,
+      "usd_amount": 4.3,
+      "converted": true,
+      "created_at": "2025-10-28T00:11:14.050Z"
+    },
+    {
+      "user_id": 1,
+      "plan_id": 102,
+      "original_currency": "BTC",
+      "original_amount": 0.002,
+      "fx_rate_to_usd": 64000,
+      "usd_amount": 128,
+      "converted": true,
+      "created_at": "2025-10-28T00:16:20.479Z"
+    },
+    {
+      "user_id": 2,
+      "plan_id": 201,
+      "original_currency": "TRX",
+      "original_amount": 12.345678,
+      "fx_rate_to_usd": 0.0955,
+      "usd_amount": 1.18,
+      "converted": true,
+      "created_at": "2025-10-28T00:16:38.434Z"
+    }
+  ],
+  "fx": {
+    "USD-USD": 1,
+    "USDT-USD": 1,
+    "TRX-USD": 0.1,
+    "BTC-USD": 68000
+  }
+}
