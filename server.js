@@ -1,5 +1,5 @@
 // server.js
-// ROI API — Auth + Wallets + ROI Settle + FX + Exchange + Investment (1.5%/day + compounding) + Hourly FX (CoinGecko)
+// ROI API — Auth + Wallets + ROI Settle + FX + Exchange + Investment (1.5%/day + compounding) + Hourly FX (CoinGecko) + Daily Auto-Compound
 // Ready for Render (PORT defaults to 10000)
 
 const express = require('express');
@@ -123,13 +123,16 @@ function toUSD(asset, amount) {
   const r = db.fx[`${asset}-USD`] || 0;
   return Number(amount || 0) * r;
 }
+function advanceISO(iso, seconds) {
+  const t = new Date(iso).getTime() + seconds * 1000;
+  return new Date(t).toISOString();
+}
 
 // -------------------------------------
 // Hourly FX from CoinGecko (BTC, TRX; USDT=1)
 // -------------------------------------
 async function updateFxFromCoingecko() {
   try {
-    // Node 18+ has global fetch; Render default node supports it
     const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,tron&vs_currencies=usd';
     const r = await fetch(url, { headers: { 'accept': 'application/json' }});
     if (!r.ok) throw new Error('FX fetch ' + r.status);
@@ -141,14 +144,56 @@ async function updateFxFromCoingecko() {
     db.fx['USDT-USD'] = 1;
     db.fx['USD-USD'] = 1;
     saveDB(db);
-    // console.log('FX updated:', db.fx);
   } catch (e) {
-    // console.warn('FX update failed:', e.message);
+    // swallow; transient errors okay
   }
 }
 // update immediately & hourly
 updateFxFromCoingecko();
 setInterval(updateFxFromCoingecko, 60 * 60 * 1000);
+
+// -------------------------------------
+// DAILY AUTO-COMPOUND SCHEDULER (every 60s)
+// -------------------------------------
+function sweepAutoCompound() {
+  let changed = false;
+  const nowMs = Date.now();
+
+  for (const u of db.users) {
+    const uid = u.id;
+    ensureInvest(uid);
+    const inv = db.investments[uid];
+    if (!inv || !inv.auto_compound) continue;
+
+    const last = new Date(inv.last_tick_at || new Date().toISOString()).getTime();
+    if (!isFinite(last)) {
+      inv.last_tick_at = new Date().toISOString();
+      changed = true;
+      continue;
+    }
+
+    const elapsedSec = Math.floor((nowMs - last) / 1000);
+    if (elapsedSec < DAY_SEC || (inv.principal_usd || 0) <= 0) continue;
+
+    // Number of full days passed since last tick
+    const days = Math.floor(elapsedSec / DAY_SEC);
+    // Compound in a single step: P * (1+r)^days
+    const p0 = Number(inv.principal_usd || 0);
+    const p1 = p0 * Math.pow(1 + DAILY_RATE, days);
+    inv.principal_usd = round2(p1);
+
+    // advance last_tick_at by whole days (keep remainder for countdown accuracy)
+    inv.last_tick_at = advanceISO(inv.last_tick_at, days * DAY_SEC);
+
+    changed = true;
+  }
+
+  if (changed) saveDB(db);
+}
+// run every minute
+setInterval(sweepAutoCompound, 60 * 1000);
+// also run once at startup (in case app slept)
+sweepAutoCompound();
 
 // -------------------------------------
 // Middleware
@@ -309,7 +354,7 @@ app.post('/exchange/convert', auth, (req, res) => {
     if (asset === 'USD' || asset === 'USDT') return Number(amt || 0);
     const r = fx[`${asset}-USD`] || 0;
     return Number(amt || 0) * r;
-    };
+  };
   const fromUSDLocal = (asset, usd) => {
     if (asset === 'USD' || asset === 'USDT') return Number(usd || 0);
     const r = fx[`${asset}-USD`] || 0;
