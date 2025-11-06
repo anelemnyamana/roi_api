@@ -32,8 +32,7 @@ function loadDB() {
         created_at: new Date().toISOString()
       }],
       nextUserId: 2,
-      // investments: userId -> { principal_usd, auto_compound, last_tick_at|null }
-      investments: {}
+      investments: {} // userId -> { principal_usd, auto_compound, last_tick_at|null }
     }, null, 2));
   }
   return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
@@ -70,15 +69,13 @@ let db = loadDB();
 
   db.users.forEach(u=>{
     if (!db.wallets[u.id]) db.wallets[u.id] = { USD:0, USDT:0, TRX:0, BTC:0, frozen:{} };
-    // IMPORTANT: start with last_tick_at = null so the timer does NOT run before first deposit
     const inv = db.investments[u.id];
     if (!inv) {
       db.investments[u.id] = { principal_usd: 0, auto_compound: false, last_tick_at: null };
     } else {
       if (inv.principal_usd == null) inv.principal_usd = 0;
       if (inv.auto_compound == null) inv.auto_compound = false;
-      // If no principal yet, ensure timer is off
-      if ((inv.principal_usd || 0) <= 0) inv.last_tick_at = null;
+      if ((inv.principal_usd || 0) <= 0) inv.last_tick_at = null; // timer off if no principal
     }
   });
 
@@ -133,7 +130,6 @@ function sweepAutoCompound(){
   for (const u of db.users){
     const uid=u.id; ensureInvest(uid);
     const inv=db.investments[uid];
-    // must have principal and a started clock
     if (!inv || !inv.auto_compound || (inv.principal_usd||0)<=0 || !inv.last_tick_at) continue;
 
     const last = new Date(inv.last_tick_at).getTime();
@@ -143,8 +139,7 @@ function sweepAutoCompound(){
     if (elapsedSec < DAY_SEC) continue;
 
     const days = Math.floor(elapsedSec/DAY_SEC);
-    // auto-compound full days: P <- P*(1+r)^days
-    inv.principal_usd = round2(Number(inv.principal_usd||0) * Math.pow(1+DAILY_RATE, days));
+    inv.principal_usd = round2(Number(inv.principal_usd||0) * Math.pow(1+DAILY_RATE, days)); // compound
     inv.last_tick_at = advanceISO(inv.last_tick_at, days*DAY_SEC);
     changed=true;
   }
@@ -154,14 +149,8 @@ setInterval(sweepAutoCompound, 60*1000);
 sweepAutoCompound();
 
 // ---------------- middleware ----------------
-app.use(cors({
-  origin:[
-    'https://*.netlify.app',
-    'https://roi-dashboard-anele.netlify.app',
-    'http://localhost:3000',
-    'http://localhost:5173'
-  ]
-}));
+// OPEN CORS for Vercel/any static host
+app.use(cors());
 app.use(express.json());
 
 // ---------------- public ----------------
