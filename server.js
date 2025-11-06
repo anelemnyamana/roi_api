@@ -1,6 +1,6 @@
 // server.js
-// ROI API — auth + wallets + ROI settle + FX + exchange
-// Works on Render (PORT defaults to 10000)
+// ROI API — Auth + Wallets + ROI Settle + FX + Exchange
+// Ready for Render (PORT defaults to 10000)
 
 const express = require('express');
 const cors = require('cors');
@@ -9,28 +9,26 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-const PORT = process.env.PORT || 10000;              // Render binds here
+const PORT = process.env.PORT || 10000;                   // Render binds here
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-super-secret';
 const DB_FILE = 'db.json';
 
-// -------------------------------
-// DB helpers (lightweight JSON DB)
-// -------------------------------
+// -------------------------------------
+// JSON "DB" helpers
+// -------------------------------------
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) {
     fs.writeFileSync(DB_FILE, JSON.stringify({
       fx: { "USD-USD":1, "USDT-USD":1, "TRX-USD":0.1, "BTC-USD":68000 },
-      wallets: {},         // userId -> { USD, USDT, TRX, BTC, frozen:{} }
-      payouts: [],         // array of payout objects
-      users: [             // seed demo user
-        {
-          id: 1,
-          email: "demo@roi.local",
-          password_hash: bcrypt.hashSync("demo123", 8),
-          roi_convert_to_usd: true,
-          created_at: new Date().toISOString()
-        }
-      ],
+      wallets: {},   // userId -> { USD, USDT, TRX, BTC, frozen:{} }
+      payouts: [],   // array
+      users: [{
+        id: 1,
+        email: "demo@roi.local",
+        password_hash: bcrypt.hashSync("demo123", 8),
+        roi_convert_to_usd: true,
+        created_at: new Date().toISOString()
+      }],
       nextUserId: 2
     }, null, 2));
   }
@@ -42,36 +40,53 @@ function saveDB(db) {
 
 let db = loadDB();
 
-// -------------------------------
-// SCHEMA MIGRATION (important!)
-// Ensures old db.json works with new auth/users structure
-// -------------------------------
-if (!db.fx) db.fx = { "USD-USD":1, "USDT-USD":1, "TRX-USD":0.1, "BTC-USD":68000 };
-if (!db.wallets) db.wallets = {};
-if (!Array.isArray(db.payouts)) db.payouts = [];
+// -------------------------------------
+// SCHEMA MIGRATION / HARDENING
+// Ensures older db.json works with auth
+// -------------------------------------
+(function migrate() {
+  if (!db.fx) db.fx = { "USD-USD":1, "USDT-USD":1, "TRX-USD":0.1, "BTC-USD":68000 };
+  if (!db.wallets) db.wallets = {};
+  if (!Array.isArray(db.payouts)) db.payouts = [];
+  if (!Array.isArray(db.users)) db.users = [];
 
-if (!Array.isArray(db.users)) {
-  db.users = [{
-    id: 1,
-    email: "demo@roi.local",
-    password_hash: bcrypt.hashSync("demo123", 8),
-    roi_convert_to_usd: true,
-    created_at: new Date().toISOString()
-  }];
-  db.nextUserId = 2;
-}
-if (!db.nextUserId) {
-  db.nextUserId = Math.max(0, ...db.users.map(u => u.id)) + 1;
-}
-if (!db.wallets[1]) db.wallets[1] = { USD:0, USDT:0, TRX:0, BTC:0, frozen:{} };
-saveDB(db);
+  // ensure demo user
+  let demo = db.users.find(u => (u.email || '').toLowerCase() === 'demo@roi.local');
+  if (!demo) {
+    demo = {
+      id: db.nextUserId || 1,
+      email: "demo@roi.local",
+      password_hash: bcrypt.hashSync("demo123", 8),
+      roi_convert_to_usd: true,
+      created_at: new Date().toISOString()
+    };
+    db.users.push(demo);
+  } else {
+    if (!demo.password_hash) demo.password_hash = bcrypt.hashSync("demo123", 8);
+    if (typeof demo.roi_convert_to_usd !== 'boolean') demo.roi_convert_to_usd = true;
+    if (!demo.created_at) demo.created_at = new Date().toISOString();
+    if (!demo.id) demo.id = 1;
+  }
 
-// -------------------------------
+  // normalize ids + nextUserId
+  db.users.forEach((u, i) => { if (!u.id) u.id = i + 1; });
+  const maxId = db.users.reduce((m, u) => Math.max(m, Number(u.id || 0)), 0);
+  db.nextUserId = Math.max(2, maxId + 1);
+
+  // wallets for all users
+  db.users.forEach(u => {
+    if (!db.wallets[u.id]) db.wallets[u.id] = { USD:0, USDT:0, TRX:0, BTC:0, frozen:{} };
+  });
+
+  saveDB(db);
+})();
+
+// -------------------------------------
 // Utils
-// -------------------------------
+// -------------------------------------
 function round2(n) { return Math.round(Number(n || 0) * 100) / 100; }
-function ensureWallet(uid) {
-  db.wallets[uid] = db.wallets[uid] || { USD:0, USDT:0, TRX:0, BTC:0, frozen:{} };
+function ensureWallet(userId) {
+  db.wallets[userId] = db.wallets[userId] || { USD:0, USDT:0, TRX:0, BTC:0, frozen:{} };
 }
 function createPayout(p) {
   db.payouts.push({ ...p, created_at: new Date().toISOString() });
@@ -88,14 +103,14 @@ function auth(req, res, next) {
     const payload = jwt.verify(token, JWT_SECRET);
     req.user = payload; // { uid, email }
     next();
-  } catch (e) {
+  } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-// -------------------------------
+// -------------------------------------
 // Middleware
-// -------------------------------
+// -------------------------------------
 app.use(cors({
   origin: [
     'https://*.netlify.app',
@@ -106,19 +121,31 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// -------------------------------
+// -------------------------------------
 // Public
-// -------------------------------
+// -------------------------------------
 app.get('/', (_req, res) => {
   res.json({ ok: true, name: 'ROI API', version: 'v1' });
 });
 
+// TEMP DEBUG (remove later)
+app.get('/__debug_schema', (_req, res) => {
+  res.json({
+    keys: Object.keys(db),
+    users: (db.users || []).map(u => ({ id: u.id, email: u.email, has_hash: !!u.password_hash })),
+    wallets_keys: db.wallets ? Object.keys(db.wallets) : [],
+    nextUserId: db.nextUserId
+  });
+});
+
+// -------------------------------------
 // Auth
+// -------------------------------------
 app.post('/auth/register', (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
-  const exists = db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
+  const exists = db.users.find(u => (u.email || '').toLowerCase() === String(email).toLowerCase());
   if (exists) return res.status(409).json({ error: 'Email already registered' });
 
   const id = db.nextUserId++;
@@ -139,8 +166,9 @@ app.post('/auth/register', (req, res) => {
 
 app.post('/auth/login', (req, res) => {
   const { email, password } = req.body || {};
-  const user = db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
+  const user = db.users.find(u => (u.email || '').toLowerCase() === String(email).toLowerCase());
   if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
   const ok = bcrypt.compareSync(password || '', user.password_hash || '');
   if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -148,7 +176,9 @@ app.post('/auth/login', (req, res) => {
   res.json({ ok: true, token, user: { id: user.id, email: user.email, roi_convert_to_usd: user.roi_convert_to_usd } });
 });
 
+// -------------------------------------
 // FX (GET public, POST protected)
+// -------------------------------------
 app.get('/fx', (_req, res) => res.json(db.fx));
 app.post('/fx', auth, (req, res) => {
   const { pair, rate } = req.body || {};
@@ -158,9 +188,9 @@ app.post('/fx', auth, (req, res) => {
   res.json({ ok: true, pair, rate });
 });
 
-// -------------------------------
+// -------------------------------------
 // Portfolio & payouts
-// -------------------------------
+// -------------------------------------
 app.get('/portfolio/:userId', (req, res) => {
   const userId = Number(req.params.userId);
   ensureWallet(userId);
@@ -196,14 +226,16 @@ app.get('/payouts/:userId', (req, res) => {
   res.json(out);
 });
 
-// -------------------------------
-// Wallet: deposit/withdraw (withdraw = negative deposit)
-// -------------------------------
+// -------------------------------------
+// Wallet: deposit / withdraw (withdraw = negative deposit)
+// -------------------------------------
 app.post('/deposit', auth, (req, res) => {
   const { userId, asset, amount } = req.body || {};
-  if (!userId || !asset || typeof amount !== 'number') return res.status(400).json({ error: 'userId, asset, amount required' });
-
+  if (!userId || !asset || typeof amount !== 'number') {
+    return res.status(400).json({ error: 'userId, asset, amount required' });
+  }
   ensureWallet(userId);
+
   const cur = Number(db.wallets[userId][asset] || 0);
   const next = round2(cur + amount);
   if (next < 0) return res.status(400).json({ error: 'Insufficient balance' });
@@ -213,9 +245,9 @@ app.post('/deposit', auth, (req, res) => {
   res.json({ ok: true, userId, asset, newBalance: db.wallets[userId][asset] });
 });
 
-// -------------------------------
+// -------------------------------------
 // Exchange (with fee %)
-// -------------------------------
+// -------------------------------------
 app.post('/exchange/convert', auth, (req, res) => {
   const { userId, fromAsset, toAsset, amount, feePct = 0 } = req.body || {};
   if (!userId || !fromAsset || !toAsset || typeof amount !== 'number') {
@@ -232,7 +264,7 @@ app.post('/exchange/convert', auth, (req, res) => {
     if (asset === 'USD' || asset === 'USDT') return Number(amt || 0);
     const r = fx[`${asset}-USD`] || 0;
     return Number(amt || 0) * r;
-  };
+    };
   const fromUSD = (asset, usd) => {
     if (asset === 'USD' || asset === 'USDT') return Number(usd || 0);
     const r = fx[`${asset}-USD`] || 0;
@@ -262,9 +294,9 @@ app.post('/exchange/convert', auth, (req, res) => {
   });
 });
 
-// -------------------------------
+// -------------------------------------
 // Settle ROI
-// -------------------------------
+// -------------------------------------
 app.post('/settle', auth, (req, res) => {
   const { userId, planId, amount, currency } = req.body || {};
   if (!userId || !planId || typeof amount !== 'number' || !currency) {
@@ -306,9 +338,9 @@ app.post('/settle', auth, (req, res) => {
   res.json({ ok: true, converted: true, credited: { asset: 'USD', amount: usdAmount }, rate });
 });
 
-// -------------------------------
+// -------------------------------------
 // Settings
-// -------------------------------
+// -------------------------------------
 app.post('/settings/roi-conversion', auth, (req, res) => {
   const { userId, enabled } = req.body || {};
   const user = db.users.find(u => u.id === Number(userId));
@@ -318,9 +350,9 @@ app.post('/settings/roi-conversion', auth, (req, res) => {
   res.json({ ok: true, userId: user.id, roi_convert_to_usd: user.roi_convert_to_usd });
 });
 
-// -------------------------------
+// -------------------------------------
 // Start
-// -------------------------------
+// -------------------------------------
 app.listen(PORT, () => {
   console.log(`ROI API running on http://localhost:${PORT}`);
 });
