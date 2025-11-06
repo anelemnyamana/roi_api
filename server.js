@@ -1,312 +1,248 @@
-// server.js — ROI Tracker Backend v1 (JSON DB)
-// Features:
-// - Multi-asset balances: USD, USDT, TRX, BTC
-// - ROI payouts with optional auto-conversion to USD
-// - Portfolio endpoint with pie-chart-ready data
-// - Payout history endpoint
-// - FX cache & admin update
-// - Lightweight JSON persistence (db.json)
-
-const fs = require('fs');
-const path = require('path');
+// server.js
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 10000; // Render uses 10000
+const JWT_SECRET = process.env.JWT_SECRET || 'change-me-super-secret';
 
-const DB_FILE = path.join(__dirname, 'db.json');
-const ASSETS = ['USD', 'USDT', 'TRX', 'BTC'];
-
-// ---------------- DB helpers ----------------
+// ---- Simple JSON "DB"
+const DB_FILE = 'db.json';
 function loadDB() {
   if (!fs.existsSync(DB_FILE)) {
-    const seed = {
-      meta: { version: 'v1', created_at: new Date().toISOString() },
+    fs.writeFileSync(DB_FILE, JSON.stringify({
+      fx: { "USD-USD":1, "USDT-USD":1, "TRX-USD":0.1, "BTC-USD":68000 },
+      wallets: {}, // userId -> { USD, USDT, TRX, BTC }
+      payouts: [], // array
       users: [
-        { id: 1, name: 'User A', roi_convert_to_usd: true },
-        { id: 2, name: 'User B', roi_convert_to_usd: false }
+        // seed demo user (password: demo123)
+        {
+          id: 1,
+          email: "demo@roi.local",
+          password_hash: bcrypt.hashSync("demo123", 8),
+          roi_convert_to_usd: true,
+          created_at: new Date().toISOString()
+        }
       ],
-      wallets: [
-        // Seed base rows so portfolio renders immediately
-        ...[1, 2].flatMap(userId =>
-          ASSETS.map(a => ({ userId, asset: a, available: 0, frozen: 0 }))
-        )
-      ],
-      payouts: [],
-      fx: {
-        'USD-USD': 1,
-        'USDT-USD': 1,
-        'TRX-USD': 0.0955,   // sample; update via /fx
-        'BTC-USD': 64000     // sample; update via /fx
-      }
-    };
-    fs.writeFileSync(DB_FILE, JSON.stringify(seed, null, 2));
-    return seed;
+      nextUserId: 2
+    }, null, 2));
   }
-  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8') || '{}');
+  return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+}
+function saveDB(db){ fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
+
+let db = loadDB();
+
+// ---- Helpers
+function round2(n){ return Math.round(n * 100) / 100; }
+function ensureWallet(uid){
+  db.wallets[uid] = db.wallets[uid] || { USD:0, USDT:0, TRX:0, BTC:0, frozen: {} };
+}
+function createPayout(p){
+  db.payouts.push({ ...p, created_at: new Date().toISOString() });
+  saveDB(db);
 }
 
-function saveDB(db) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
+// ---- Middleware
+app.use(cors({
+  origin: [
+    "https://*.netlify.app",
+    "https://roi-dashboard-anele.netlify.app",
+    "http://localhost:3000"
+  ]
+}));
+app.use(express.json());
+
+// ---- Auth utils
+function signToken(user){
+  return jwt.sign({ uid: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 }
-
-// ---------------- Utils ----------------
-const round2 = x => Math.round(Number(x) * 100) / 100;
-const round6 = x => Math.round(Number(x) * 1e6) / 1e6;
-
-function findUser(db, userId) {
-  return db.users.find(u => u.id === Number(userId));
-}
-
-function getWallet(db, userId, asset) {
-  if (!ASSETS.includes(asset)) throw new Error('Unsupported asset: ' + asset);
-  let w = db.wallets.find(
-    w => w.userId === Number(userId) && w.asset === asset
-  );
-  if (!w) {
-    w = { userId: Number(userId), asset, available: 0, frozen: 0 };
-    db.wallets.push(w);
+function auth(req, res, next){
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if(!token) return res.status(401).json({ error: 'Missing token' });
+  try{
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  }catch(e){
+    return res.status(401).json({ error: 'Invalid token' });
   }
-  return w;
 }
 
-function credit(db, userId, asset, amount) {
-  const w = getWallet(db, userId, asset);
-  w.available = round6(Number(w.available) + Number(amount));
-  return w.available;
-}
+// ---- Public
+app.get('/', (req,res)=>{ res.json({ ok:true, name:'ROI API', version:'v1' }); });
 
-function debit(db, userId, asset, amount) {
-  const w = getWallet(db, userId, asset);
-  const a = Number(amount);
-  if (Number(w.available) < a) throw new Error(`Insufficient ${asset} balance`);
-  w.available = round6(Number(w.available) - a);
-  return w.available;
-}
-
-function getFx(db, pair) {
-  const r = db.fx[pair];
-  if (r == null) throw new Error('Missing FX rate for ' + pair);
-  return Number(r);
-}
-
-function toUsd(db, asset, amount) {
-  const rate = getFx(db, `${asset}-USD`);
-  return { usd: round2(Number(amount) * rate), rate };
-}
-
-// ---------------- Routes ----------------
-
-// Health
-app.get('/', (req, res) => {
-  res.json({ ok: true, name: 'ROI API', version: 'v1' });
+// ---- Auth endpoints
+app.post('/auth/register', (req,res)=>{
+  const { email, password } = req.body;
+  if(!email || !password) return res.status(400).json({ error:'email and password required' });
+  if(db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase())){
+    return res.status(409).json({ error:'Email already registered' });
+  }
+  const id = db.nextUserId++;
+  const user = {
+    id,
+    email,
+    password_hash: bcrypt.hashSync(password, 8),
+    roi_convert_to_usd: true,
+    created_at: new Date().toISOString()
+  };
+  db.users.push(user);
+  ensureWallet(id);
+  saveDB(db);
+  const token = signToken(user);
+  res.json({ ok:true, token, user: { id:user.id, email:user.email, roi_convert_to_usd:user.roi_convert_to_usd } });
 });
 
-// Get FX cache
-app.get('/fx', (req, res) => {
-  const db = loadDB();
-  res.json(db.fx);
+app.post('/auth/login', (req,res)=>{
+  const { email, password } = req.body;
+  const user = db.users.find(u => u.email.toLowerCase() === String(email).toLowerCase());
+  if(!user) return res.status(401).json({ error:'Invalid credentials' });
+  if(!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error:'Invalid credentials' });
+  const token = signToken(user);
+  res.json({ ok:true, token, user: { id:user.id, email:user.email, roi_convert_to_usd:user.roi_convert_to_usd } });
 });
 
-// Admin: set/update FX rate (e.g., {"pair":"TRX-USD","rate":0.097})
-app.post('/fx', (req, res) => {
-  const { pair, rate } = req.body || {};
-  if (!pair || typeof rate !== 'number') {
-    return res.status(400).json({ error: 'Provide { pair, rate:number }' });
-  }
-  const db = loadDB();
+// ---- Protected endpoints
+
+// FX get/update
+app.get('/fx', (req,res)=> res.json(db.fx));
+app.post('/fx', auth, (req,res)=>{
+  let { pair, rate } = req.body;
+  if(!pair || typeof rate !== 'number') return res.status(400).json({ error:'pair and numeric rate required' });
   db.fx[pair] = rate;
   saveDB(db);
-  res.json({ ok: true, pair, rate });
+  res.json({ ok:true, pair, rate });
 });
 
-// Toggle auto-conversion of ROI to USD
-// Body: { userId:number, enabled:boolean }
-app.post('/settings/roi-conversion', (req, res) => {
-  const { userId, enabled } = req.body || {};
-  if (userId == null || typeof enabled !== 'boolean') {
-    return res.status(400).json({ error: 'Provide { userId, enabled:boolean }' });
-  }
-  const db = loadDB();
-  const user = findUser(db, userId);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  user.roi_convert_to_usd = enabled;
+// Settings
+app.post('/settings/roi-conversion', auth, (req,res)=>{
+  const { userId, enabled } = req.body;
+  const user = db.users.find(u => u.id === Number(userId));
+  if(!user) return res.status(404).json({ error:'User not found' });
+  user.roi_convert_to_usd = !!enabled;
   saveDB(db);
-  res.json({ ok: true, userId: Number(userId), roi_convert_to_usd: enabled });
+  res.json({ ok:true, userId:user.id, roi_convert_to_usd:user.roi_convert_to_usd });
 });
 
-// Portfolio with USD equivalents + pie
-// GET /portfolio/:userId
-app.get('/portfolio/:userId', (req, res) => {
-  const db = loadDB();
+// Portfolio
+app.get('/portfolio/:userId', (req,res)=>{
   const userId = Number(req.params.userId);
-  if (!findUser(db, userId)) return res.status(404).json({ error: 'User not found' });
-
-  // Ensure all wallets exist
-  const rows = ASSETS.map(a => getWallet(db, userId, a));
-
-  // Compute USD equivalents
-  const breakdown = rows.map(w => {
-    const { usd } = toUsd(db, w.asset, w.available);
-    return {
-      asset: w.asset,
-      available: Number(w.available),
-      frozen: Number(w.frozen),
-      usd
-    };
-  });
-
-  const totalUsd = round2(breakdown.reduce((s, r) => s + r.usd, 0));
-  const pie = breakdown.map(r => ({
-    asset: r.asset,
-    usd: r.usd,
-    percent: totalUsd > 0 ? round2((r.usd / totalUsd) * 100) : 0
-  }));
-
+  ensureWallet(userId);
+  const w = db.wallets[userId];
+  const fx = db.fx;
+  const toUSD = (asset, amount)=>{
+    if(asset==='USD' || asset==='USDT') return amount;
+    const pair = `${asset}-USD`;
+    return round2((amount||0) * (fx[pair] || 0));
+  };
+  const rows = [
+    { asset:'USD', available: w.USD||0, usd: round2(w.USD||0) },
+    { asset:'USDT', available: w.USDT||0, usd: round2(w.USDT||0) },
+    { asset:'TRX', available: w.TRX||0, usd: round2(toUSD('TRX', w.TRX||0)) },
+    { asset:'BTC', available: w.BTC||0, usd: round2(toUSD('BTC', w.BTC||0)) }
+  ];
+  const total = round2(rows.reduce((s,r)=>s + r.usd, 0));
   res.json({
     userId,
-    totalUsd,
-    breakdown, // table-friendly
-    pie        // chart-friendly
+    totalUsd: total,
+    breakdown: rows,
+    pie: rows.map(r => ({ asset:r.asset, usd:r.usd, percent: total ? round2((r.usd/total)*100) : 0 }))
   });
 });
 
-// Payout history
-// GET /payouts/:userId
-app.get('/payouts/:userId', (req, res) => {
-  const db = loadDB();
+// Payouts
+app.get('/payouts/:userId', (req,res)=>{
   const userId = Number(req.params.userId);
-  if (!findUser(db, userId)) return res.status(404).json({ error: 'User not found' });
-  const list = db.payouts
-    .filter(p => p.user_id === userId)
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  res.json(list);
+  const out = db.payouts.filter(p => p.user_id === userId);
+  res.json(out);
 });
 
-// Manual top-up/deposit (optional helper to simulate funds)
-// Body: { userId, asset, amount }
-app.post('/deposit', (req, res) => {
-  const { userId, asset, amount } = req.body || {};
-  const db = loadDB();
-  try {
-    if (!userId || !asset || typeof amount !== 'number') {
-      return res.status(400).json({ error: 'Provide { userId, asset, amount:number }' });
-    }
-    if (!findUser(db, userId)) return res.status(404).json({ error: 'User not found' });
-    credit(db, userId, asset, amount);
-    saveDB(db);
-    res.json({ ok: true, userId: Number(userId), asset, newBalance: getWallet(db, userId, asset).available });
-  } catch (e) {
-    res.status(400).json({ error: String(e.message || e) });
-  }
+// Deposit (+/- for withdraw demo)
+app.post('/deposit', auth, (req,res)=>{
+  const { userId, asset, amount } = req.body;
+  if(!userId || !asset || typeof amount !== 'number') return res.status(400).json({ error:'userId, asset, amount required' });
+  ensureWallet(userId);
+  if(!db.wallets[userId][asset]) db.wallets[userId][asset] = 0;
+  const next = (db.wallets[userId][asset] + amount);
+  if(next < 0) return res.status(400).json({ error:'Insufficient balance' });
+  db.wallets[userId][asset] = round2(next);
+  saveDB(db);
+  res.json({ ok:true, userId, asset, newBalance: db.wallets[userId][asset] });
 });
 
-// Exchange/convert (manual) — simple market convert with optional fee
-// Body: { userId, fromAsset, toAsset, amount, feePct? }
-// Example: { userId:1, fromAsset:'USDT', toAsset:'USD', amount:100, feePct:0.2 }
-app.post('/exchange/convert', (req, res) => {
-  const { userId, fromAsset, toAsset, amount, feePct } = req.body || {};
-  const db = loadDB();
-  try {
-    if (!userId || !fromAsset || !toAsset || typeof amount !== 'number') {
-      return res.status(400).json({ error: 'Provide { userId, fromAsset, toAsset, amount:number }' });
-    }
-    if (fromAsset === toAsset) return res.status(400).json({ error: 'fromAsset and toAsset cannot match' });
-    if (!findUser(db, userId)) return res.status(404).json({ error: 'User not found' });
+// Exchange
+app.post('/exchange/convert', auth, (req,res)=>{
+  const { userId, fromAsset, toAsset, amount, feePct=0 } = req.body;
+  if(!userId || !fromAsset || !toAsset || typeof amount !== 'number') return res.status(400).json({ error:'missing fields' });
+  ensureWallet(userId);
+  if((db.wallets[userId][fromAsset]||0) < amount) return res.status(400).json({ error:'Insufficient '+fromAsset+' balance' });
 
-    // Debit source
-    debit(db, userId, fromAsset, amount);
+  const fx = db.fx;
+  const toUSD = (asset, amt)=>{
+    if(asset==='USD' || asset==='USDT') return amt;
+    const pair = `${asset}-USD`;
+    return (amt||0) * (fx[pair] || 0);
+  };
+  const fromUSD = (asset, usd)=>{
+    if(asset==='USD' || asset==='USDT') return usd;
+    const pair = `${asset}-USD`;
+    const r = fx[pair] || 0;
+    return r ? (usd/r) : 0;
+  };
 
-    // Convert to USD using from-asset rate, then to target via inverse
-    const { usd: usdValue, rate: fromRate } = toUsd(db, fromAsset, amount);
-    let targetAmount;
-    if (toAsset === 'USD') {
-      targetAmount = usdValue;
-    } else {
-      const toRate = getFx(db, `${toAsset}-USD`); // toAsset-USD
-      // amount_in_toAsset = usd / toRate
-      targetAmount = usdValue / toRate;
-      // Keep reasonable precision for crypto
-      targetAmount = ['BTC', 'TRX'].includes(toAsset) ? round6(targetAmount) : round2(targetAmount);
-    }
+  const grossUsd = toUSD(fromAsset, amount);
+  const netUsd = grossUsd * (1 - (Number(feePct)||0)/100);
+  const out = fromUSD(toAsset, netUsd);
 
-    // Apply optional fee on target amount
-    const feePctNum = feePct ? Number(feePct) : 0;
-    const fee = targetAmount * (feePctNum / 100);
-    const credited = ['BTC', 'TRX'].includes(toAsset) ? round6(targetAmount - fee) : round2(targetAmount - fee);
+  db.wallets[userId][fromAsset] = round2((db.wallets[userId][fromAsset]||0) - amount);
+  db.wallets[userId][toAsset] = round2((db.wallets[userId][toAsset]||0) + out);
+  saveDB(db);
 
-    credit(db, userId, toAsset, credited);
-    saveDB(db);
+  res.json({ ok:true, userId,
+    from:{ asset:fromAsset, amount },
+    to:{ asset:toAsset, amount: out },
+    fx:{ fromPair:`${fromAsset}-USD`, fromRate: fx[`${fromAsset}-USD`]||1, toPair:`${toAsset}-USD`, toRate: fx[`${toAsset}-USD`]||1 },
+    feePct: Number(feePct)||0
+  });
+});
 
-    res.json({
-      ok: true,
-      userId: Number(userId),
-      from: { asset: fromAsset, amount },
-      to: { asset: toAsset, amount: credited },
-      fx: { fromPair: `${fromAsset}-USD`, fromRate, toPair: `${toAsset}-USD`, toRate: getFx(db, `${toAsset}-USD`) },
-      feePct: feePctNum
+// Settle ROI
+app.post('/settle', auth, (req,res)=>{
+  const { userId, planId, amount, currency } = req.body;
+  if(!userId || !planId || typeof amount !== 'number' || !currency) return res.status(400).json({ error:'missing fields' });
+  const user = db.users.find(u => u.id === Number(userId));
+  if(!user) return res.status(404).json({ error:'User not found' });
+  ensureWallet(userId);
+
+  const convert = !!user.roi_convert_to_usd;
+  if(!convert){
+    db.wallets[userId][currency] = round2((db.wallets[userId][currency]||0) + amount);
+    createPayout({
+      user_id:userId, plan_id:planId,
+      original_currency: currency, original_amount: amount,
+      fx_rate_to_usd: null, usd_amount:null, converted:false
     });
-  } catch (e) {
-    res.status(400).json({ error: String(e.message || e) });
+    return res.json({ ok:true, converted:false, credited:{ asset:currency, amount } });
   }
+  const pair = `${currency}-USD`;
+  const rate = db.fx[pair] || 0;
+  const usdAmount = round2(amount * rate);
+  db.wallets[userId]['USD'] = round2((db.wallets[userId]['USD']||0) + usdAmount);
+  createPayout({
+    user_id:userId, plan_id:planId,
+    original_currency: currency, original_amount: amount,
+    fx_rate_to_usd: rate, usd_amount: usdAmount, converted:true
+  });
+  res.json({ ok:true, converted:true, credited: { asset:'USD', amount: usdAmount }, rate });
 });
 
-// Settle ROI payout (core)
-// Body: { userId, planId, amount:number, currency:'USDT'|'TRX'|'BTC'|'USD' }
-// When user's setting roi_convert_to_usd=true, credit USD instead (at current FX)
-app.post('/settle', (req, res) => {
-  const { userId, planId, amount, currency } = req.body || {};
-  const db = loadDB();
-  const created_at = new Date().toISOString();
-
-  try {
-    if (!userId || !planId || typeof amount !== 'number' || !currency) {
-      return res.status(400).json({ error: 'Provide { userId, planId, amount:number, currency }' });
-    }
-    if (!ASSETS.includes(currency)) return res.status(400).json({ error: 'Unsupported currency: ' + currency });
-
-    const user = findUser(db, userId);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    if (user.roi_convert_to_usd) {
-      // Convert to USD and credit USD
-      const { usd, rate } = toUsd(db, currency, amount);
-      credit(db, userId, 'USD', usd);
-      db.payouts.push({
-        user_id: Number(userId),
-        plan_id: planId,
-        original_currency: currency,
-        original_amount: amount,
-        fx_rate_to_usd: rate,
-        usd_amount: usd,
-        converted: true,
-        created_at
-      });
-      saveDB(db);
-      return res.json({ ok: true, converted: true, credited: { asset: 'USD', amount: usd }, rate });
-    } else {
-      // Credit in native currency
-      credit(db, userId, currency, amount);
-      db.payouts.push({
-        user_id: Number(userId),
-        plan_id: planId,
-        original_currency: currency,
-        original_amount: amount,
-        fx_rate_to_usd: null,
-        usd_amount: null,
-        converted: false,
-        created_at
-      });
-      saveDB(db);
-      return res.json({ ok: true, converted: false, credited: { asset: currency, amount } });
-    }
-  } catch (e) {
-    res.status(400).json({ error: String(e.message || e) });
-  }
+// ---- Start
+app.listen(PORT, ()=> {
+  console.log(`ROI API running on http://localhost:${PORT}`);
 });
-
-// --------------- Start Server ---------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ROI API running on http://localhost:${PORT}`));

@@ -1,24 +1,16 @@
 {
   "name": "roi_api",
   "version": "1.0.0",
-  "description": "ROI Tracker Backend API (v1) using JSON database",
+  "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "keywords": [
-    "ROI",
-    "tracker",
-    "api",
-    "nodejs",
-    "express",
-    "crypto"
-  ],
-  "author": "Anele Gento",
-  "license": "ISC",
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "bcryptjs": "2.4.3",
+    "cors": "2.8.5",
+    "express": "4.19.2",
+    "jsonwebtoken": "9.0.2"
   }
 }
