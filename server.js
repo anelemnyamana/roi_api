@@ -1,8 +1,8 @@
 // server.js
 // ROI API — Auth + Wallets + ROI Settle + FX + Exchange
 // + Investment (1.5%/day simple interest until reinvest) + Hourly FX (CoinGecko)
-// + Daily Auto-Compound for users who enable it
-// Ready for Render (PORT defaults to 10000)
+// + Daily Auto-Compound (opt-in) + Timer starts ONLY after first successful deposit
+// Render default PORT=10000
 
 const express = require('express');
 const cors = require('cors');
@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-super-secret';
 const DB_FILE = 'db.json';
 const DAY_SEC = 86400;
-const DAILY_RATE = 0.015; // 1.5% per day
+const DAILY_RATE = 0.015; // 1.5% per day (simple interest until reinvest)
 
 // ---------------- DB helpers ----------------
 function loadDB() {
@@ -32,7 +32,7 @@ function loadDB() {
         created_at: new Date().toISOString()
       }],
       nextUserId: 2,
-      // investments: userId -> { principal_usd, auto_compound, last_tick_at }
+      // investments: userId -> { principal_usd, auto_compound, last_tick_at|null }
       investments: {}
     }, null, 2));
   }
@@ -70,9 +70,16 @@ let db = loadDB();
 
   db.users.forEach(u=>{
     if (!db.wallets[u.id]) db.wallets[u.id] = { USD:0, USDT:0, TRX:0, BTC:0, frozen:{} };
-    if (!db.investments[u.id]) db.investments[u.id] = {
-      principal_usd: 0, auto_compound: false, last_tick_at: new Date().toISOString()
-    };
+    // IMPORTANT: start with last_tick_at = null so the timer does NOT run before first deposit
+    const inv = db.investments[u.id];
+    if (!inv) {
+      db.investments[u.id] = { principal_usd: 0, auto_compound: false, last_tick_at: null };
+    } else {
+      if (inv.principal_usd == null) inv.principal_usd = 0;
+      if (inv.auto_compound == null) inv.auto_compound = false;
+      // If no principal yet, ensure timer is off
+      if ((inv.principal_usd || 0) <= 0) inv.last_tick_at = null;
+    }
   });
 
   saveDB(db);
@@ -81,7 +88,9 @@ let db = loadDB();
 // ---------------- utils ----------------
 const round2 = n => Math.round(Number(n||0)*100)/100;
 function ensureWallet(uid){ db.wallets[uid] ||= { USD:0, USDT:0, TRX:0, BTC:0, frozen:{} }; }
-function ensureInvest(uid){ db.investments[uid] ||= { principal_usd:0, auto_compound:false, last_tick_at:new Date().toISOString() }; }
+function ensureInvest(uid){
+  db.investments[uid] ||= { principal_usd:0, auto_compound:false, last_tick_at:null };
+}
 function creditAsset(uid, asset, amt){
   ensureWallet(uid);
   db.wallets[uid][asset] = round2((db.wallets[uid][asset]||0) + Number(amt||0));
@@ -124,18 +133,18 @@ function sweepAutoCompound(){
   for (const u of db.users){
     const uid=u.id; ensureInvest(uid);
     const inv=db.investments[uid];
-    if (!inv || !inv.auto_compound) continue;
+    // must have principal and a started clock
+    if (!inv || !inv.auto_compound || (inv.principal_usd||0)<=0 || !inv.last_tick_at) continue;
 
-    const last = new Date(inv.last_tick_at||new Date().toISOString()).getTime();
-    if (!isFinite(last)){ inv.last_tick_at=new Date().toISOString(); changed=true; continue; }
+    const last = new Date(inv.last_tick_at).getTime();
+    if (!isFinite(last)) continue;
 
     const elapsedSec = Math.floor((nowMs - last)/1000);
-    if (elapsedSec < DAY_SEC || (inv.principal_usd||0)<=0) continue;
+    if (elapsedSec < DAY_SEC) continue;
 
     const days = Math.floor(elapsedSec/DAY_SEC);
     // auto-compound full days: P <- P*(1+r)^days
-    const p0 = Number(inv.principal_usd||0);
-    inv.principal_usd = round2(p0 * Math.pow(1+DAILY_RATE, days));
+    inv.principal_usd = round2(Number(inv.principal_usd||0) * Math.pow(1+DAILY_RATE, days));
     inv.last_tick_at = advanceISO(inv.last_tick_at, days*DAY_SEC);
     changed=true;
   }
@@ -268,44 +277,65 @@ app.post('/settle',auth,(req,res)=>{
 
 // ---------------- investment engine ----------------
 // Deposit to investment: converts amount→USD, increases principal,
-// and **resets the timer** exactly at the moment of successful deposit.
+// and **starts the timer** ONLY on success (sets last_tick_at = now)
 app.post('/invest/deposit',auth,(req,res)=>{
   const {userId,asset,amount}=req.body||{};
   if(!userId||!asset||typeof amount!=='number') return res.status(400).json({error:'userId, asset, amount required'});
   ensureInvest(userId);
 
-  // Convert to USD (this does NOT debit wallet; wallet debit could be added later if desired)
   const addUsd = round2(toUSD(asset, amount));
   if (addUsd <= 0) return res.status(400).json({error:'Amount must be > 0'});
 
-  // Increase principal and reset last_tick_at to NOW (start counting from this deposit)
   const inv = db.investments[userId];
   inv.principal_usd = round2((inv.principal_usd || 0) + addUsd);
-  inv.last_tick_at = new Date().toISOString(); // <<< starts new 24h window only on success
+  inv.last_tick_at = new Date().toISOString(); // start 24h window now
   saveDB(db);
 
   res.json({ ok:true, principal_usd: inv.principal_usd, last_tick_at: inv.last_tick_at });
 });
 
-// Status: simple interest on current principal since last_tick_at
+// Status: if principal==0 OR no last_tick_at → timer OFF (no countdown)
 app.get('/invest/status/:userId',(req,res)=>{
   const uid=Number(req.params.userId); ensureInvest(uid);
   const inv=db.investments[uid];
+
+  if ((inv.principal_usd||0) <= 0 || !inv.last_tick_at) {
+    return res.json({
+      ok:true,
+      principal_usd: round2(inv.principal_usd||0),
+      daily_rate: DAILY_RATE,
+      accrued_usd: 0,
+      last_tick_at: null,
+      seconds_to_next: null,
+      auto_compound: !!inv.auto_compound
+    });
+  }
+
   const now=Date.now();
-  const last=new Date(inv.last_tick_at||new Date().toISOString()).getTime();
+  const last=new Date(inv.last_tick_at).getTime();
   const elapsedSec=Math.max(0,(now-last)/1000);
-  const accrued=round2((inv.principal_usd||0)*DAILY_RATE*(elapsedSec/DAY_SEC)); // 1.5% of principal per 24h until reinvest/claim
+  const accrued=round2((inv.principal_usd||0)*DAILY_RATE*(elapsedSec/DAY_SEC)); // simple interest until reinvest/claim
   const toNext=Math.max(0,DAY_SEC-Math.floor(elapsedSec%DAY_SEC));
-  res.json({ok:true,principal_usd:round2(inv.principal_usd||0),daily_rate:DAILY_RATE,accrued_usd:accrued,last_tick_at:inv.last_tick_at,seconds_to_next:toNext,auto_compound:!!inv.auto_compound});
+
+  res.json({
+    ok:true,
+    principal_usd: round2(inv.principal_usd||0),
+    daily_rate: DAILY_RATE,
+    accrued_usd: accrued,
+    last_tick_at: inv.last_tick_at,
+    seconds_to_next: toNext,
+    auto_compound: !!inv.auto_compound
+  });
 });
 
-// Reinvest: add accrued to principal and reset timer
+// Reinvest: add accrued to principal and reset timer (requires timer started)
 app.post('/invest/reinvest',auth,(req,res)=>{
   const {userId}=req.body||{}; if(!userId) return res.status(400).json({error:'userId required'});
   ensureInvest(userId);
   const inv=db.investments[userId];
+  if (!inv.last_tick_at || (inv.principal_usd||0)<=0) return res.status(400).json({error:'No active accrual period'});
   const now=Date.now();
-  const last=new Date(inv.last_tick_at||new Date().toISOString()).getTime();
+  const last=new Date(inv.last_tick_at).getTime();
   const elapsedSec=Math.max(0,(now-last)/1000);
   const accrued=(inv.principal_usd||0)*DAILY_RATE*(elapsedSec/DAY_SEC);
   inv.principal_usd=round2((inv.principal_usd||0)+accrued);
@@ -314,13 +344,14 @@ app.post('/invest/reinvest',auth,(req,res)=>{
   res.json({ok:true,principal_usd:inv.principal_usd});
 });
 
-// Claim: pay accrued to USD wallet, do NOT change principal, reset timer
+// Claim: pay accrued to USD wallet, do NOT change principal, reset timer (requires timer started)
 app.post('/invest/claim',auth,(req,res)=>{
   const {userId}=req.body||{}; if(!userId) return res.status(400).json({error:'userId required'});
   ensureInvest(userId); ensureWallet(userId);
   const inv=db.investments[userId];
+  if (!inv.last_tick_at || (inv.principal_usd||0)<=0) return res.status(400).json({error:'No active accrual period'});
   const now=Date.now();
-  const last=new Date(inv.last_tick_at||new Date().toISOString()).getTime();
+  const last=new Date(inv.last_tick_at).getTime();
   const elapsedSec=Math.max(0,(now-last)/1000);
   const accrued=round2((inv.principal_usd||0)*DAILY_RATE*(elapsedSec/DAY_SEC));
   creditAsset(userId,'USD',accrued);
